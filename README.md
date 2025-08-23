@@ -348,11 +348,13 @@ if __name__ == "__main__":
 
 ==============================---------------------------------------------------------------------
 06 floki_agent_gemini.py
+# floki_agent.py
 
 import asyncio
-from ingest import run_collector
+from sqlalchemy import text
+
 from vectorstore import add_documents_to_vectorstore, search_vectorstore
-from db import NewsItem, async_session
+from db import async_session
 from config import GEMINI_API_KEY
 from agents import Agent, Runner, OpenAIChatCompletionsModel, set_tracing_disabled, function_tool
 from openai import AsyncOpenAI
@@ -371,7 +373,7 @@ client = AsyncOpenAI(
 )
 
 # -----------------------------
-# Use Floki system instruction exactly as provided
+# Floki system instruction
 # -----------------------------
 FLOKI_INSTRUCTION = (
     "Your name is Floki. You are a friendly, helpful, and super encouraging AI onboarding "
@@ -390,19 +392,17 @@ FLOKI_INSTRUCTION = (
 )
 
 # -----------------------------
-# Model setup with Floki instructions
+# Model setup
 # -----------------------------
 model = OpenAIChatCompletionsModel(
     model="gemini-2.0-flash",
     openai_client=client,
-    system_instruction=FLOKI_INSTRUCTION
 )
 
 # -----------------------------
-# Tools
+# Normal async functions (callable manually)
 # -----------------------------
-@function_tool
-async def summarize_text_tool(text: str) -> str:
+async def summarize_text(text: str) -> str:
     prompt = f"Summarize this text in 3 bullet points:\n{text}"
     resp = await client.chat.completions.create(
         model="gemini-2.0-flash",
@@ -411,23 +411,28 @@ async def summarize_text_tool(text: str) -> str:
     )
     return resp.choices[0].message.content
 
-@function_tool
 async def get_user_info(user_id: str) -> str:
     return f"User {user_id} | Name: Abid | Role: Reader"
 
-@function_tool
 async def get_user_history(user_id: str) -> str:
     async with async_session() as session:
         result = await session.execute(
-            "SELECT title FROM news_items ORDER BY id DESC LIMIT 5"
+            text("SELECT title FROM news_items ORDER BY id DESC LIMIT 5")
         )
         rows = result.fetchall()
         return " | ".join([row[0] for row in rows]) if rows else "No history yet."
 
-@function_tool
 async def get_user_relevant_news(user_id: str) -> str:
     results = search_vectorstore("stocks", n_results=3)
     return " | ".join(results['documents'][0]) if results['documents'] else "No news found."
+
+# -----------------------------
+# Register functions as Agent tools
+# -----------------------------
+summarize_text_tool = function_tool(summarize_text)
+get_user_info_tool = function_tool(get_user_info)
+get_user_history_tool = function_tool(get_user_history)
+get_user_relevant_news_tool = function_tool(get_user_relevant_news)
 
 # -----------------------------
 # Floki Agent
@@ -437,9 +442,9 @@ news_agent = Agent(
     instructions=FLOKI_INSTRUCTION,
     tools=[
         summarize_text_tool,
-        get_user_info,
-        get_user_history,
-        get_user_relevant_news
+        get_user_info_tool,
+        get_user_history_tool,
+        get_user_relevant_news_tool,
     ],
     model=model
 )
@@ -450,29 +455,45 @@ news_agent = Agent(
 async def main():
     user_id = "1234"  # example
 
+    async def run_collector():
+        async with async_session() as session:
+            result = await session.execute(
+                text("SELECT id, title FROM news_items ORDER BY id DESC LIMIT 5")
+            )
+            rows = result.fetchall()
+
+            class Article:
+                def __init__(self, id, title):
+                    self.id = id
+                    self.title = title
+
+            return [Article(r[0], r[1]) for r in rows]
+
     # Step 1: Collect news
     articles = await run_collector()
     print(f"Collected {len(articles)} articles")
 
-    # Step 2: Summarize using Floki agent
-    news_texts = [f"{idx+1}. {n.title}" for idx, n in enumerate(articles)]
-    full_text = "\n".join(news_texts)
-
+    # Step 2: Fetch user data (manual functions)
     user_info = await get_user_info(user_id)
     history = await get_user_history(user_id)
     relevant_news = await get_user_relevant_news(user_id)
 
+    # Prepare content
+    news_texts = [f"{idx+1}. {n.title}" for idx, n in enumerate(articles)]
+    full_text = "\n".join(news_texts)
+
     full_prompt = f"{user_info}\nHistory: {history}\nRelevant news: {relevant_news}\nNews to summarize:\n{full_text}"
 
+    # Step 3: Summarize with agent
     summarized_text = await Runner.run(news_agent, full_prompt)
     print("Summary output from Floki Gemini:\n", summarized_text.final_output)
 
-    # Step 3: Add to vectorstore
+    # Step 4: Add to vectorstore
     docs = [{"id": art.id, "title": art.title, "text": art.title} for art in articles]
     add_documents_to_vectorstore(docs)
     print("Added to vectorstore.")
 
-    # Step 4: Example vector search
+    # Step 5: Example vector search
     query_results = search_vectorstore("stocks", n_results=3)
     if query_results['documents']:
         print("Vectorstore search result:", query_results['documents'][0])
@@ -485,91 +506,86 @@ if __name__ == "__main__":
 
 
 
+
 ============================---------------------------------------------------------------------============================---------------------------------------------------------------------
 07
 # vectorstore.py
-
-import asyncio
-from chromadb import Client
-from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+import chromadb
 from chromadb.utils import embedding_functions
-from config import VECTORSTORE_DIR
-from db import async_session, NewsItem, Journal, Emotion, Trade, FeatureUsage, ResetChallenge, RecoveryPlan, RulebookVote, SimulatorLog
+import requests
+from bs4 import BeautifulSoup
+import asyncio
+from db import async_session, NewsItem, Journal  # etc.
 
-# -----------------------------
-# Chroma client setup
-# -----------------------------
-client = Client(Settings(
-    chroma_db_impl="duckdb+parquet",
-    persist_directory=VECTORSTORE_DIR
-))
+# ----------------------------
+# Step 1: Setup Chroma DB
+# ----------------------------
+client = chromadb.Client()
+collection = client.get_or_create_collection("all_data_embeddings")
 
-embedding_func = embedding_functions.OpenAIEmbeddingFunction(
-    api_key=None,  # Add your Gemini/OpenAI API key here
-    model_name="text-embedding-3-large"
-)
+# ----------------------------
+# Step 2: Load free embedding model
+# ----------------------------
+model = SentenceTransformer('all-MiniLM-L6-v2')  # free & lightweight
 
-collection = client.get_or_create_collection(
-    name="fundedflow_embeddings",
-    embedding_function=embedding_func
-)
-
-# -----------------------------
-# Add documents
-# -----------------------------
-def add_documents_to_vectorstore(docs):
-    for doc in docs:
-        collection.add(
-            documents=[doc["text"]],
-            metadatas=[{"title": doc.get("title", ""), "url": doc.get("url", "")}],
-            ids=[str(doc["id"])]
-        )
-
-# -----------------------------
-# Search documents
-# -----------------------------
-def search_vectorstore(query, n_results=5):
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results
-    )
-    return results
-
-# -----------------------------
-# Fetch all data from DB and embed
-# -----------------------------
+# ----------------------------
+# Step 3: Add DB records
+# ----------------------------
 async def fetch_and_embed_all():
     async with async_session() as session:
         texts = []
 
         async def batch_fetch(model_class):
             result = await session.execute(f"SELECT * FROM {model_class.__tablename__}")
-            for row in result.fetchall():
+            rows = result.fetchall()
+            for row in rows:
                 texts.append({
                     "id": f"{model_class.__name__.lower()}_{row.id}",
                     "text": str(row.__dict__),
                     "title": getattr(row, "title", "")
                 })
 
-        # List all models you want to embed
-        models = [Journal, Emotion, Trade, FeatureUsage, ResetChallenge, RecoveryPlan, RulebookVote, SimulatorLog, NewsItem]
-
+        models = [Journal, NewsItem]  # Add other models
         for m in models:
             await batch_fetch(m)
 
-        # Add all to vectorstore
-        add_documents_to_vectorstore(texts)
-        print(f"✅ Embedded {len(texts)} records successfully!")
+        for doc in texts:
+            vector = model.encode(doc["text"]).tolist()
+            collection.add(
+                documents=[doc["text"]],
+                embeddings=[vector],
+                ids=[doc["id"]],
+            )
 
-# -----------------------------
-# Run embedding if called directly
-# -----------------------------
+# ----------------------------
+# Step 4: Scrape website & embed
+# ----------------------------
+def scrape_and_embed_website(url):
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, "html.parser")
+    text = " ".join([p.get_text() for p in soup.find_all("p")])
+
+    # Split into chunks
+    chunk_size = 500
+    words = text.split()
+    chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+
+    for i, chunk in enumerate(chunks):
+        vector = model.encode(chunk).tolist()
+        collection.add(
+            documents=[chunk],
+            embeddings=[vector],
+            ids=[f"website_{i}"]
+        )
+
+# ----------------------------
+# Run everything
+# ----------------------------
 if __name__ == "__main__":
     asyncio.run(fetch_and_embed_all())
-
-
-
-
+    scrape_and_embed_website("https://example.com")  # Replace with your site
+    print("✅ All DB + Website data embedded successfully!")
 
 
 
@@ -684,3 +700,11 @@ async def startup_event():
 
 
 uvicorn api:app --reload
+
+==
+llmfor the embeddig 
+
+
+pip install requests beautifulsoup4
+pip install sentence-transformers
+pip install chromadb

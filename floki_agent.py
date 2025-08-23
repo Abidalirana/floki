@@ -1,9 +1,10 @@
-#floki_agent.py
+# floki_agent.py
 
 import asyncio
+from sqlalchemy import text
 
-from vectorstore import add_documents_to_vectorstore, search_vectorstore
-from db import NewsItem, async_session
+from vectorstore import fetch_and_embed_all, scrape_and_embed_website, search_vectorstore, add_documents_to_vectorstore
+from db import async_session
 from config import GEMINI_API_KEY
 from agents import Agent, Runner, OpenAIChatCompletionsModel, set_tracing_disabled, function_tool
 from openai import AsyncOpenAI
@@ -22,7 +23,7 @@ client = AsyncOpenAI(
 )
 
 # -----------------------------
-# Use Floki system instruction exactly as provided
+# Floki system instruction
 # -----------------------------
 FLOKI_INSTRUCTION = (
     "Your name is Floki. You are a friendly, helpful, and super encouraging AI onboarding "
@@ -41,19 +42,17 @@ FLOKI_INSTRUCTION = (
 )
 
 # -----------------------------
-# Model setup with Floki instructions
+# Model setup
 # -----------------------------
 model = OpenAIChatCompletionsModel(
     model="gemini-2.0-flash",
     openai_client=client,
-    
 )
 
 # -----------------------------
-# Tools
+# Normal async functions (callable manually)
 # -----------------------------
-@function_tool
-async def summarize_text_tool(text: str) -> str:
+async def summarize_text(text: str) -> str:
     prompt = f"Summarize this text in 3 bullet points:\n{text}"
     resp = await client.chat.completions.create(
         model="gemini-2.0-flash",
@@ -62,23 +61,28 @@ async def summarize_text_tool(text: str) -> str:
     )
     return resp.choices[0].message.content
 
-@function_tool
 async def get_user_info(user_id: str) -> str:
     return f"User {user_id} | Name: Abid | Role: Reader"
 
-@function_tool
 async def get_user_history(user_id: str) -> str:
     async with async_session() as session:
         result = await session.execute(
-            "SELECT title FROM news_items ORDER BY id DESC LIMIT 5"
+            text("SELECT title FROM news_items ORDER BY id DESC LIMIT 5")
         )
         rows = result.fetchall()
         return " | ".join([row[0] for row in rows]) if rows else "No history yet."
 
-@function_tool
 async def get_user_relevant_news(user_id: str) -> str:
     results = search_vectorstore("stocks", n_results=3)
     return " | ".join(results['documents'][0]) if results['documents'] else "No news found."
+
+# -----------------------------
+# Register functions as Agent tools
+# -----------------------------
+summarize_text_tool = function_tool(summarize_text)
+get_user_info_tool = function_tool(get_user_info)
+get_user_history_tool = function_tool(get_user_history)
+get_user_relevant_news_tool = function_tool(get_user_relevant_news)
 
 # -----------------------------
 # Floki Agent
@@ -88,9 +92,9 @@ news_agent = Agent(
     instructions=FLOKI_INSTRUCTION,
     tools=[
         summarize_text_tool,
-        get_user_info,
-        get_user_history,
-        get_user_relevant_news
+        get_user_info_tool,
+        get_user_history_tool,
+        get_user_relevant_news_tool,
     ],
     model=model
 )
@@ -101,32 +105,50 @@ news_agent = Agent(
 async def main():
     user_id = "1234"  # example
 
+    async def run_collector():
+        async with async_session() as session:
+            result = await session.execute(
+                text("SELECT id, title FROM news_items ORDER BY id DESC LIMIT 5")
+            )
+            rows = result.fetchall()
+
+            class Article:
+                def __init__(self, id, title):
+                    self.id = id
+                    self.title = title
+
+            return [Article(r[0], r[1]) for r in rows]
+
     # Step 1: Collect news
     articles = await run_collector()
     print(f"Collected {len(articles)} articles")
 
-    # Step 2: Summarize using Floki agent
-    news_texts = [f"{idx+1}. {n.title}" for idx, n in enumerate(articles)]
-    full_text = "\n".join(news_texts)
-
+    # Step 2: Fetch user data (manual functions)
     user_info = await get_user_info(user_id)
     history = await get_user_history(user_id)
     relevant_news = await get_user_relevant_news(user_id)
 
+    # Prepare content
+    news_texts = [f"{idx+1}. {n.title}" for idx, n in enumerate(articles)]
+    full_text = "\n".join(news_texts)
+
     full_prompt = f"{user_info}\nHistory: {history}\nRelevant news: {relevant_news}\nNews to summarize:\n{full_text}"
 
+    # Step 3: Summarize with agent
     summarized_text = await Runner.run(news_agent, full_prompt)
     print("Summary output from Floki Gemini:\n", summarized_text.final_output)
 
-    # Step 3: Add to vectorstore
-    docs = [{"id": art.id, "title": art.title, "text": art.title} for art in articles]
+    # Step 4: Add to vectorstore with proper metadatas
+    docs = [{"text": art.title, "metadatas": {"id": art.id, "title": art.title}} for art in articles]
     add_documents_to_vectorstore(docs)
     print("Added to vectorstore.")
 
-    # Step 4: Example vector search
+    # Step 5: Example vector search
     query_results = search_vectorstore("stocks", n_results=3)
     if query_results['documents']:
         print("Vectorstore search result:", query_results['documents'][0])
+        print("Vectorstore metadatas:", query_results['metadatas'][0])  # ✅ use metadatas instead of ids
+
 
 # -----------------------------
 # Run
