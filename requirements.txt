@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+sqlalchemy[asyncio]
+asyncpg
+aiosqlite
+aiohttp
+beautifulsoup4
+openai
+python-dotenv
+chromadb
+pydantic
