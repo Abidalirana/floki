@@ -36,6 +36,9 @@ async def root():
 # -----------------------------
 # Ask Floki endpoint
 # -----------------------------
+# -----------------------------
+# Ask Floki endpoint (efficient for large DB)
+# -----------------------------
 @app.post("/ask")
 async def ask_floki(request: QueryRequest):
     try:
@@ -43,11 +46,13 @@ async def ask_floki(request: QueryRequest):
         vector_results = search_vectorstore(request.query, n_results=request.n_results)
         relevant_texts = " | ".join(vector_results['documents'][0]) if vector_results['documents'] else "No relevant news."
 
-        # Step 2: Get last 5 news as history
+        # Step 2: Fetch all news in chunks (100 at a time)
         async with async_session() as session:
-            result = await session.execute("SELECT title FROM news_items ORDER BY id DESC LIMIT 5")
-            rows = result.all()
-            history = " | ".join([row[0] for row in rows]) if rows else "No history yet."
+            result = await session.execute("SELECT title FROM news_items ORDER BY id ASC")
+            rows = result.fetchall()
+            chunk_size = 100  # fetch in chunks
+            history_chunks = [" | ".join([row[0] for row in rows[i:i+chunk_size]]) for i in range(0, len(rows), chunk_size)]
+            history = " || ".join(history_chunks) if history_chunks else "No history yet."
 
         response = f"User {request.user_id} Query: {request.query}\nHistory: {history}\nRelevant news: {relevant_texts}"
         return {"response": response}
@@ -109,5 +114,3 @@ async def startup_event():
             await asyncio.sleep(60*10)  # every 10 minutes
 
     asyncio.create_task(periodic_update())
-
-#=============================
