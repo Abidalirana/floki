@@ -1,8 +1,11 @@
+# api.py
+
 import asyncio
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from vectorstore import fetch_and_embed_all, scrape_and_embed_website, search_vectorstore
-from db import async_session, NewsItem, Journal
+from db import async_session, Journal
+from agent import news_agent, Runner, get_user_info, get_user_history, get_user_relevant_news
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -34,28 +37,31 @@ async def root():
     return {"message": "Floki Live RAG Agent Running!"}
 
 # -----------------------------
-# Ask Floki endpoint
-# -----------------------------
-# -----------------------------
-# Ask Floki endpoint (efficient for large DB)
+# Ask Floki
 # -----------------------------
 @app.post("/ask")
 async def ask_floki(request: QueryRequest):
     try:
-        # Step 1: Search vectorstore
+        # Search vectorstore
         vector_results = search_vectorstore(request.query, n_results=request.n_results)
         relevant_texts = " | ".join(vector_results['documents'][0]) if vector_results['documents'] else "No relevant news."
 
-        # Step 2: Fetch all news in chunks (100 at a time)
+        # Fetch DB history
         async with async_session() as session:
             result = await session.execute("SELECT title FROM news_items ORDER BY id ASC")
             rows = result.fetchall()
-            chunk_size = 100  # fetch in chunks
-            history_chunks = [" | ".join([row[0] for row in rows[i:i+chunk_size]]) for i in range(0, len(rows), chunk_size)]
-            history = " || ".join(history_chunks) if history_chunks else "No history yet."
+            history = " | ".join([row[0] for row in rows]) if rows else "No history yet."
 
-        response = f"User {request.user_id} Query: {request.query}\nHistory: {history}\nRelevant news: {relevant_texts}"
-        return {"response": response}
+        # Compose prompt
+        user_info = await get_user_info(request.user_id)
+        user_history = await get_user_history(request.user_id)
+        user_news = await get_user_relevant_news(request.user_id)
+        full_prompt = f"{user_info}\nHistory: {user_history}\nRelevant news: {user_news}\nQuery: {request.query}"
+
+        # Run agent
+        summarized_text = await Runner.run(news_agent, full_prompt)
+
+        return {"response": summarized_text.final_output}
 
     except Exception as e:
         logger.error(f"Error in /ask: {str(e)}")
@@ -68,7 +74,11 @@ async def ask_floki(request: QueryRequest):
 async def save_journal(request: SaveJournalRequest):
     try:
         async with async_session() as session:
-            new_entry = Journal(user_id=request.user_id, text=request.text, sentiment_score=request.sentiment_score)
+            new_entry = Journal(
+                user_id=request.user_id,
+                text=request.text,
+                sentiment_score=request.sentiment_score
+            )
             session.add(new_entry)
             await session.commit()
         return {"status": "✅ Journal saved!"}
@@ -77,40 +87,34 @@ async def save_journal(request: SaveJournalRequest):
         raise HTTPException(status_code=500, detail="Failed to save journal.")
 
 # -----------------------------
-# Background tasks: update embeddings
+# Background tasks
 # -----------------------------
 @app.post("/update_embeddings")
 async def update_embeddings(background_tasks: BackgroundTasks):
     background_tasks.add_task(fetch_and_embed_all)
     return {"message": "✅ Embedding update started in background."}
 
-# -----------------------------
-# Background tasks: scrape website
-# -----------------------------
 @app.post("/scrape_website")
 async def scrape_website(request: ScrapeRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(scrape_and_embed_website, request.url)
     return {"message": f"✅ Scraping started for {request.url}"}
 
 # -----------------------------
-# Startup event: optionally run periodic tasks
+# Startup event
 # -----------------------------
 @app.on_event("startup")
 async def startup_event():
     logger.info("Floki Live RAG Agent starting up...")
-
-    # Scrape your website once at startup
-    website_url = "https://your-website.com"  # <-- put your full website here
+    website_url = "https://fundedflow.app"
     asyncio.create_task(scrape_and_embed_website(website_url))
 
-    # Periodic updates
     async def periodic_update():
         while True:
             try:
                 logger.info("Running periodic embedding update...")
-                await fetch_and_embed_all()  # fetch & embed all data from Supabase + other sources
+                await fetch_and_embed_all()
             except Exception as e:
                 logger.error(f"Periodic update error: {str(e)}")
-            await asyncio.sleep(60*10)  # every 10 minutes
+            await asyncio.sleep(60*10)
 
     asyncio.create_task(periodic_update())

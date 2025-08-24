@@ -224,48 +224,10 @@ async def init_db():
     print("✅ All tables created successfully!")
 
 ====================================================---------------------------------------------------------------------
-4️⃣ ingest.py
-
-We’ll fetch a few sample finance headlines:
-
-import aiohttp
-from bs4 import BeautifulSoup
-from typing import List
-from db import NewsItem, async_session
-
-NEWS_SOURCES = [
-    "https://www.cnbc.com/finance/",
-    "https://www.reuters.com/finance/"
-]
-
-async def fetch_html(url: str) -> str:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            return await resp.text()
-
-async def scrape_articles() -> List[NewsItem]:
-    articles = []
-    for source in NEWS_SOURCES:
-        html = await fetch_html(source)
-        soup = BeautifulSoup(html, "html.parser")
-        headlines = soup.select("a")[:5]
-        for link in headlines:
-            title = link.get_text(strip=True)
-            url = link.get("href")
-            if title and url:
-                articles.append(NewsItem(title=title, url=url))
-    async with async_session() as session:
-        session.add_all(articles)
-        await session.commit()
-    return articles
-
-async def run_collector() -> List[NewsItem]:
-    return await scrape_articles()
 ==============================---------------------------------------------------------------------
 
-==============================---------------------------------------------------------------------
 
-05 vectorstore.py
+04 vectorstore.py
 # vectorstore.py
 
 import asyncio
@@ -347,7 +309,7 @@ if __name__ == "__main__":
     asyncio.run(fetch_and_embed_all())
 
 ==============================---------------------------------------------------------------------
-06 floki_agent_gemini.py
+05 floki_agent_gemini.py
 # floki_agent.py
 
 import asyncio
@@ -508,7 +470,7 @@ if __name__ == "__main__":
 
 
 ============================---------------------------------------------------------------------============================---------------------------------------------------------------------
-07
+06
 # vectorstore.py
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -593,7 +555,7 @@ if __name__ == "__main__":
 
 ============================================--------------------------------------------------------------vvvv------------------------------------------------------------------------------------------
 
-08
+07
 api.py 
 
 import asyncio

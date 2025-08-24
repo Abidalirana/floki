@@ -65,14 +65,18 @@ def search_vectorstore(query: str, n_results: int = 3):
 def add_documents_to_vectorstore(docs):
     """
     Add a list of documents to ChromaDB vectorstore.
-    Each doc should be like: {"text": "...", "metadatas": {"id": ..., "title": ...}}
+    Each doc should be like: {"text": "...", "metadata": {"id": ..., "title": ...}}
     """
     for i, doc in enumerate(docs):
         vector = model.encode(doc["text"]).tolist()
+        metadata = doc.get("metadata")
+        if not metadata or not isinstance(metadata, dict):
+            raise ValueError("Each document must have a non-empty metadata dictionary!")
+        
         collection.add(
             documents=[doc["text"]],
             embeddings=[vector],
-            metadatas=[doc.get("metadatas", {})],
+            metadatas=[metadata],   # <-- use metadata, not metadatas
             ids=[f"doc_{i}"]
         )
     print(f"✅ Added {len(docs)} documents to vectorstore.")

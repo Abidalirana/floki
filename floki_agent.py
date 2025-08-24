@@ -2,6 +2,7 @@
 
 import asyncio
 from sqlalchemy import text
+from datetime import datetime, timezone
 
 from vectorstore import fetch_and_embed_all, scrape_and_embed_website, search_vectorstore, add_documents_to_vectorstore
 from db import async_session
@@ -50,13 +51,12 @@ model = OpenAIChatCompletionsModel(
 )
 
 # -----------------------------
-# Normal async functions (callable manually)
+# Async helper functions
 # -----------------------------
 async def summarize_text(text: str) -> str:
-    prompt = f"Summarize this text in 3 bullet points:\n{text}"
     resp = await client.chat.completions.create(
         model="gemini-2.0-flash",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": f"Summarize this text in 3 bullet points:\n{text}"}],
         temperature=0.3
     )
     return resp.choices[0].message.content
@@ -66,9 +66,7 @@ async def get_user_info(user_id: str) -> str:
 
 async def get_user_history(user_id: str) -> str:
     async with async_session() as session:
-        result = await session.execute(
-            text("SELECT title FROM news_items ORDER BY id DESC LIMIT 5")
-        )
+        result = await session.execute(text("SELECT title FROM news_items ORDER BY id DESC LIMIT 5"))
         rows = result.fetchall()
         return " | ".join([row[0] for row in rows]) if rows else "No history yet."
 
@@ -100,58 +98,44 @@ news_agent = Agent(
 )
 
 # -----------------------------
-# Main async workflow
+# Interactive CLI loop
 # -----------------------------
-async def main():
-    user_id = "1234"  # example
+async def interactive_loop():
+    user_id = "1234"
 
-    async def run_collector():
-        async with async_session() as session:
-            result = await session.execute(
-                text("SELECT id, title FROM news_items ORDER BY id DESC LIMIT 5")
-            )
-            rows = result.fetchall()
+    print("🟢 Floki Agent Interactive Testing Started! Type 'exit' to quit.\n")
 
-            class Article:
-                def __init__(self, id, title):
-                    self.id = id
-                    self.title = title
+    while True:
+        query = input("Enter your query: ")
+        if query.lower() in ["exit", "quit"]:
+            print("🛑 Exiting Floki Agent testing loop.")
+            break
 
-            return [Article(r[0], r[1]) for r in rows]
+        # Fetch info/history/news
+        user_info = await get_user_info(user_id)
+        history = await get_user_history(user_id)
+        relevant_news = await get_user_relevant_news(user_id)
+        full_prompt = f"{user_info}\nHistory: {history}\nRelevant news: {relevant_news}\nQuery: {query}"
 
-    # Step 1: Collect news
-    articles = await run_collector()
-    print(f"Collected {len(articles)} articles")
+        # Run agent
+        summarized_text = await Runner.run(news_agent, full_prompt)
+        print("\n💬 Floki Agent Response:\n", summarized_text.final_output)
 
-    # Step 2: Fetch user data (manual functions)
-    user_info = await get_user_info(user_id)
-    history = await get_user_history(user_id)
-    relevant_news = await get_user_relevant_news(user_id)
-
-    # Prepare content
-    news_texts = [f"{idx+1}. {n.title}" for idx, n in enumerate(articles)]
-    full_text = "\n".join(news_texts)
-
-    full_prompt = f"{user_info}\nHistory: {history}\nRelevant news: {relevant_news}\nNews to summarize:\n{full_text}"
-
-    # Step 3: Summarize with agent
-    summarized_text = await Runner.run(news_agent, full_prompt)
-    print("Summary output from Floki Gemini:\n", summarized_text.final_output)
-
-    # Step 4: Add to vectorstore with proper metadatas
-    docs = [{"text": art.title, "metadatas": {"id": art.id, "title": art.title}} for art in articles]
-    add_documents_to_vectorstore(docs)
-    print("Added to vectorstore.")
-
-    # Step 5: Example vector search
-    query_results = search_vectorstore("stocks", n_results=3)
-    if query_results['documents']:
-        print("Vectorstore search result:", query_results['documents'][0])
-        print("Vectorstore metadatas:", query_results['metadatas'][0])  # ✅ use metadatas instead of ids
-
+        # ✅ Add last query to vectorstore (fixed metadata)
+        add_documents_to_vectorstore([
+            {
+                "text": query,
+                "metadata": {  # ✅ singular key
+                    "user_id": user_id,
+                    "source": "interactive_loop",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            }
+        ])
+        print("✅ Query added to vectorstore.\n")
 
 # -----------------------------
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(interactive_loop())
