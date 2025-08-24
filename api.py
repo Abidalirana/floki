@@ -1,14 +1,18 @@
 import asyncio
 import logging
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from db import async_session, Journal
-from floki_agent import (  
+from floki_agent import (
     search_vectorstore,
-    get_user_info, 
-    get_user_history, 
+    get_user_info,
+    get_user_history,
     get_user_relevant_news,
-    fetch_and_embed_all           
+    floki_agent,
+    save_query,
+    add_to_vectorstore,
+    fetch_and_embed_website,
+    get_past_queries,
+    collection
 )
 
 # -----------------------------
@@ -30,59 +34,76 @@ class QueryRequest(BaseModel):
     query: str
     n_results: int = 3
 
-class SaveJournalRequest(BaseModel):
-    user_id: int
-    text: str
-    sentiment_score: float | None = None
+class EmbedRequest(BaseModel):
+    url: str
 
 # -----------------------------
-# Endpoints
+# GET endpoints
 # -----------------------------
 @app.get("/")
 async def root():
     return {"message": "Floki Live RAG Agent Running!"}
 
+@app.get("/past_queries")
+async def past_queries(user_id: str = Query(..., description="User ID to fetch past queries")):
+    try:
+        queries = await get_past_queries(user_id)
+        return {"user_id": user_id, "queries": queries}
+    except Exception as e:
+        logger.error(f"Error fetching past queries for {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch past queries.")
+
+@app.get("/vectorstore_status")
+async def vectorstore_status():
+    try:
+        num_docs = len(collection.get(include=["documents"])["documents"])
+        return {"num_documents": num_docs}
+    except Exception as e:
+        logger.error(f"Error fetching vectorstore status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch vectorstore status.")
+
+# -----------------------------
+# POST endpoints
+# -----------------------------
 @app.post("/ask")
 async def ask_floki(request: QueryRequest):
     try:
+        # Search vectorstore for relevant context
         results = search_vectorstore(request.query, n_results=request.n_results)
-        relevant_texts = " | ".join(results['documents'][0]) if results['documents'] else "No relevant news."
+        relevant_texts = " | ".join(results['documents'][0]) if results['documents'] else "No relevant info found."
 
+        # Get user info, history, and news
         user_info = await get_user_info(request.user_id)
         user_history = await get_user_history(request.user_id)
         user_news = await get_user_relevant_news(request.user_id)
 
+        # Build full prompt
         full_prompt = (
             f"{user_info}\nHistory: {user_history}\nRelevant news: {user_news}\n"
-            f"Vectorstore results: {relevant_texts}\nQuery: {request.query}"
+            f"Vectorstore context: {relevant_texts}\nUser Query: {request.query}"
         )
 
-        return {"response": full_prompt}
+        # Generate response from Floki agent
+        response = await floki_agent.run(full_prompt, context={"user_id": request.user_id})
+
+        # Save query in DB and vectorstore
+        await save_query(request.user_id, request.query)
+        add_to_vectorstore(request.query, {"user_id": request.user_id, "source": "ask_endpoint"})
+
+        return {"response": response.final_output}
 
     except Exception as e:
         logger.error(f"Error in /ask: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to process request.")
 
-@app.post("/save_journal")
-async def save_journal(request: SaveJournalRequest):
+@app.post("/embed_website")
+async def embed_website(request: EmbedRequest):
     try:
-        async with async_session() as session:
-            new_entry = Journal(
-                user_id=request.user_id,
-                text=request.text,
-                sentiment_score=request.sentiment_score
-            )
-            session.add(new_entry)
-            await session.commit()
-        return {"status": "✅ Journal saved!"}
+        await fetch_and_embed_website(request.url)
+        return {"message": f"✅ Website {request.url} fetched and embedded successfully."}
     except Exception as e:
-        logger.error(f"Error saving journal: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to save journal.")
-
-@app.post("/update_embeddings")
-async def update_embeddings(background_tasks: BackgroundTasks):
-    background_tasks.add_task(fetch_and_embed_all)   # 👈 schedules website re-embedding
-    return {"message": "✅ Embedding update started in background."}
+        logger.error(f"Error embedding website {request.url}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch and embed website.")
 
 # -----------------------------
 # Startup event
@@ -90,10 +111,14 @@ async def update_embeddings(background_tasks: BackgroundTasks):
 @app.on_event("startup")
 async def startup_event():
     logger.info("Floki Live RAG Agent starting up...")
-    asyncio.create_task(fetch_and_embed_all())       # 👈 runs embeddings on boot
+    try:
+        await fetch_and_embed_website("https://fundedflow.app/")
+        logger.info("✅ FundedFlow website embedded successfully at startup.")
+    except Exception as e:
+        logger.error(f"❌ Failed to embed FundedFlow website at startup: {e}")
 
 # -----------------------------
-# Run
+# Run server
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
