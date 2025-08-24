@@ -7,11 +7,10 @@ floki_agent/
 ├─ .env
 ├─ .gitignore
 ├─ .python-version
-├─ api.py
+├─ api.py     #FastAPI + vectorstore endpoints
 ├─ config.py
-├─ db.py
-├─ floki_agent.py      #is a full AI assistant agent:
-├─ vectorstore.py      # New: RAG vector DB + embedding+ loaiwe all inside of it
+├─ db.py         #database models & session
+├─ floki_agent.py      #AI agent logic (embeddings, summarizer, user info)
 ├─ pyproject.toml
 ├─ README.md
 ├─ requirements.txt
@@ -225,97 +224,15 @@ async def init_db():
 
 ====================================================---------------------------------------------------------------------
 ==============================---------------------------------------------------------------------
-
-
-04 vectorstore.py
-# vectorstore.py
-
-import asyncio
-from chromadb import Client
-from chromadb.config import Settings
-from chromadb.utils import embedding_functions
-from config import VECTORSTORE_DIR
-from db import async_session, NewsItem, Journal, Emotion, Trade, FeatureUsage, ResetChallenge, RecoveryPlan, RulebookVote, SimulatorLog
-
-# -----------------------------
-# Chroma client setup
-# -----------------------------
-client = Client(Settings(
-    chroma_db_impl="duckdb+parquet",
-    persist_directory=VECTORSTORE_DIR
-))
-
-embedding_func = embedding_functions.OpenAIEmbeddingFunction(
-    api_key=None,  # Add your Gemini/OpenAI API key here
-    model_name="text-embedding-3-large"
-)
-
-collection = client.get_or_create_collection(
-    name="fundedflow_embeddings",
-    embedding_function=embedding_func
-)
-
-# -----------------------------
-# Add documents
-# -----------------------------
-def add_documents_to_vectorstore(docs):
-    for doc in docs:
-        collection.add(
-            documents=[doc["text"]],
-            metadatas=[{"title": doc.get("title", ""), "url": doc.get("url", "")}],
-            ids=[str(doc["id"])]
-        )
-
-# -----------------------------
-# Search documents
-# -----------------------------
-def search_vectorstore(query, n_results=5):
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results
-    )
-    return results
-
-# -----------------------------
-# Fetch all data from DB and embed
-# -----------------------------
-async def fetch_and_embed_all():
-    async with async_session() as session:
-        texts = []
-
-        async def batch_fetch(model_class):
-            result = await session.execute(f"SELECT * FROM {model_class.__tablename__}")
-            for row in result.fetchall():
-                texts.append({
-                    "id": f"{model_class.__name__.lower()}_{row.id}",
-                    "text": str(row.__dict__),
-                    "title": getattr(row, "title", "")
-                })
-
-        # List all models you want to embed
-        models = [Journal, Emotion, Trade, FeatureUsage, ResetChallenge, RecoveryPlan, RulebookVote, SimulatorLog, NewsItem]
-
-        for m in models:
-            await batch_fetch(m)
-
-        # Add all to vectorstore
-        add_documents_to_vectorstore(texts)
-        print(f"✅ Embedded {len(texts)} records successfully!")
-
-# -----------------------------
-# Run embedding if called directly
-# -----------------------------
-if __name__ == "__main__":
-    asyncio.run(fetch_and_embed_all())
-
-==============================---------------------------------------------------------------------
-05 floki_agent_gemini.py
+04 floki_agent_gemini.py
+# floki_agent.py
 # floki_agent.py
 
 import asyncio
 from sqlalchemy import text
+from datetime import datetime, timezone
 
-from vectorstore import add_documents_to_vectorstore, search_vectorstore
+from vectorstore import fetch_and_embed_all, scrape_and_embed_website, search_vectorstore, add_documents_to_vectorstore
 from db import async_session
 from config import GEMINI_API_KEY
 from agents import Agent, Runner, OpenAIChatCompletionsModel, set_tracing_disabled, function_tool
@@ -362,13 +279,12 @@ model = OpenAIChatCompletionsModel(
 )
 
 # -----------------------------
-# Normal async functions (callable manually)
+# Async helper functions
 # -----------------------------
 async def summarize_text(text: str) -> str:
-    prompt = f"Summarize this text in 3 bullet points:\n{text}"
     resp = await client.chat.completions.create(
         model="gemini-2.0-flash",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": f"Summarize this text in 3 bullet points:\n{text}"}],
         temperature=0.3
     )
     return resp.choices[0].message.content
@@ -378,9 +294,7 @@ async def get_user_info(user_id: str) -> str:
 
 async def get_user_history(user_id: str) -> str:
     async with async_session() as session:
-        result = await session.execute(
-            text("SELECT title FROM news_items ORDER BY id DESC LIMIT 5")
-        )
+        result = await session.execute(text("SELECT title FROM news_items ORDER BY id DESC LIMIT 5"))
         rows = result.fetchall()
         return " | ".join([row[0] for row in rows]) if rows else "No history yet."
 
@@ -412,104 +326,134 @@ news_agent = Agent(
 )
 
 # -----------------------------
-# Main async workflow
+# Interactive CLI loop
 # -----------------------------
-async def main():
-    user_id = "1234"  # example
+async def interactive_loop():
+    user_id = "1234"
 
-    async def run_collector():
-        async with async_session() as session:
-            result = await session.execute(
-                text("SELECT id, title FROM news_items ORDER BY id DESC LIMIT 5")
-            )
-            rows = result.fetchall()
+    print("🟢 Floki Agent Interactive Testing Started! Type 'exit' to quit.\n")
 
-            class Article:
-                def __init__(self, id, title):
-                    self.id = id
-                    self.title = title
+    while True:
+        query = input("Enter your query: ")
+        if query.lower() in ["exit", "quit"]:
+            print("🛑 Exiting Floki Agent testing loop.")
+            break
 
-            return [Article(r[0], r[1]) for r in rows]
+        # Fetch info/history/news
+        user_info = await get_user_info(user_id)
+        history = await get_user_history(user_id)
+        relevant_news = await get_user_relevant_news(user_id)
+        full_prompt = f"{user_info}\nHistory: {history}\nRelevant news: {relevant_news}\nQuery: {query}"
 
-    # Step 1: Collect news
-    articles = await run_collector()
-    print(f"Collected {len(articles)} articles")
+        # Run agent
+        summarized_text = await Runner.run(news_agent, full_prompt)
+        print("\n💬 Floki Agent Response:\n", summarized_text.final_output)
 
-    # Step 2: Fetch user data (manual functions)
-    user_info = await get_user_info(user_id)
-    history = await get_user_history(user_id)
-    relevant_news = await get_user_relevant_news(user_id)
-
-    # Prepare content
-    news_texts = [f"{idx+1}. {n.title}" for idx, n in enumerate(articles)]
-    full_text = "\n".join(news_texts)
-
-    full_prompt = f"{user_info}\nHistory: {history}\nRelevant news: {relevant_news}\nNews to summarize:\n{full_text}"
-
-    # Step 3: Summarize with agent
-    summarized_text = await Runner.run(news_agent, full_prompt)
-    print("Summary output from Floki Gemini:\n", summarized_text.final_output)
-
-    # Step 4: Add to vectorstore
-    docs = [{"id": art.id, "title": art.title, "text": art.title} for art in articles]
-    add_documents_to_vectorstore(docs)
-    print("Added to vectorstore.")
-
-    # Step 5: Example vector search
-    query_results = search_vectorstore("stocks", n_results=3)
-    if query_results['documents']:
-        print("Vectorstore search result:", query_results['documents'][0])
+        # ✅ Add last query to vectorstore (fixed metadata)
+        add_documents_to_vectorstore([
+            {
+                "text": query,
+                "metadata": {  # ✅ singular key
+                    "user_id": user_id,
+                    "source": "interactive_loop",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            }
+        ])
+        print("✅ Query added to vectorstore.\n")
 
 # -----------------------------
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(interactive_loop())
 
 
 
 
-============================---------------------------------------------------------------------============================---------------------------------------------------------------------
-06
-# vectorstore.py
+============================---------------------------------------------------------------------=======================
+============================================--------------------------------------------------------------vvvv------------------------------------------------------------------------------------------
+05
+# api.py
+
+import asyncio
+import logging
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.utils import embedding_functions
-import requests
 from bs4 import BeautifulSoup
-import asyncio
-from db import async_session, NewsItem, Journal  # etc.
+import requests
+from sqlalchemy import text
+from db import async_session, NewsItem, Journal
+from floki_agent import news_agent, Runner, get_user_info, get_user_history, get_user_relevant_news
 
-# ----------------------------
-# Step 1: Setup Chroma DB
-# ----------------------------
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="Floki Live RAG Agent")
+
+# -----------------------------
+# Request models
+# -----------------------------
+class QueryRequest(BaseModel):
+    user_id: str
+    query: str
+    n_results: int = 3
+
+class ScrapeRequest(BaseModel):
+    url: str
+
+class SaveJournalRequest(BaseModel):
+    user_id: int
+    text: str
+    sentiment_score: float | None = None
+
+# -----------------------------
+# ChromaDB + Sentence Transformer setup
+# -----------------------------
 client = chromadb.Client()
 collection = client.get_or_create_collection("all_data_embeddings")
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# ----------------------------
-# Step 2: Load free embedding model
-# ----------------------------
-model = SentenceTransformer('all-MiniLM-L6-v2')  # free & lightweight
+# -----------------------------
+# Helper: run async in background safely
+# -----------------------------
+def run_async_task(coro, *args, **kwargs):
+    asyncio.create_task(coro(*args, **kwargs))
 
-# ----------------------------
-# Step 3: Add DB records
-# ----------------------------
+# -----------------------------
+# Vectorstore operations
+# -----------------------------
 async def fetch_and_embed_all():
     async with async_session() as session:
         texts = []
 
         async def batch_fetch(model_class):
-            result = await session.execute(f"SELECT * FROM {model_class.__tablename__}")
+            result = await session.execute(text(f"SELECT * FROM {model_class.__tablename__}"))
             rows = result.fetchall()
             for row in rows:
+                text_content = ""
+                if "title" in row.keys():
+                    text_content += f"Title: {row.title} "
+                if "summary" in row.keys():
+                    text_content += f"Summary: {row.summary} "
+                if "text" in row.keys():
+                    text_content += f"Text: {row.text} "
                 texts.append({
                     "id": f"{model_class.__name__.lower()}_{row.id}",
-                    "text": str(row.__dict__),
-                    "title": getattr(row, "title", "")
+                    "text": text_content.strip(),
+                    "title": getattr(row, "title", ""),
+                    "metadata": {"id": row.id, "title": getattr(row, "title", "")}
                 })
 
-        models = [Journal, NewsItem]  # Add other models
-        for m in models:
+        for m in [Journal, NewsItem]:
             await batch_fetch(m)
 
         for doc in texts:
@@ -518,147 +462,154 @@ async def fetch_and_embed_all():
                 documents=[doc["text"]],
                 embeddings=[vector],
                 ids=[doc["id"]],
+                metadatas=[doc.get("metadata", {})]
             )
+    logger.info(f"✅ Embedded {len(texts)} DB records successfully!")
 
-# ----------------------------
-# Step 4: Scrape website & embed
-# ----------------------------
-def scrape_and_embed_website(url):
+async def scrape_and_embed_website(url):
     response = requests.get(url)
     soup = BeautifulSoup(response.text, "html.parser")
     text = " ".join([p.get_text() for p in soup.find_all("p")])
-
-    # Split into chunks
     chunk_size = 500
     words = text.split()
     chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
-
     for i, chunk in enumerate(chunks):
         vector = model.encode(chunk).tolist()
         collection.add(
             documents=[chunk],
             embeddings=[vector],
-            ids=[f"website_{i}"]
+            ids=[f"website_{i}"],
+            metadatas=[{"source": url}]
         )
+    logger.info(f"✅ Embedded {len(chunks)} chunks from {url}")
 
-# ----------------------------
-# Run everything
-# ----------------------------
-if __name__ == "__main__":
-    asyncio.run(fetch_and_embed_all())
-    scrape_and_embed_website("https://example.com")  # Replace with your site
-    print("✅ All DB + Website data embedded successfully!")
+def search_vectorstore(query: str, n_results: int = 3):
+    query_vector = model.encode(query).tolist()
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"]
+    )
+    return results
 
-
-
-
-
-============================================--------------------------------------------------------------vvvv------------------------------------------------------------------------------------------
-
-07
-api.py 
-
-import asyncio
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from typing import Optional
-from floki_agent_gemini import news_agent, Runner, add_documents_to_vectorstore, run_collector, search_vectorstore
-from db import async_session, NewsItem
-import logging
-
-# -----------------------------
-# Setup logging
-# -----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def add_documents_to_vectorstore(docs):
+    for i, doc in enumerate(docs):
+        vector = model.encode(doc["text"]).tolist()
+        metadata = doc.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        collection.add(
+            documents=[doc["text"]],
+            embeddings=[vector],
+            ids=[f"doc_{i}"],
+            metadatas=[metadata]
+        )
+    logger.info(f"✅ Added {len(docs)} documents to vectorstore.")
 
 # -----------------------------
-# FastAPI app
-# -----------------------------
-app = FastAPI(title="Floki Gemini RAG Agent")
-
-# -----------------------------
-# Request body schema
-# -----------------------------
-class QueryRequest(BaseModel):
-    user_id: str
-    query: str
-    n_results: Optional[int] = 3  # Optional: number of relevant news items
-
-# -----------------------------
-# Health check
+# FastAPI endpoints
 # -----------------------------
 @app.get("/")
 async def root():
-    return {"message": "Floki Gemini RAG Agent Running!"}
+    return {"message": "Floki Live RAG Agent Running!"}
 
-# -----------------------------
-# Ask Floki endpoint
-# -----------------------------
 @app.post("/ask")
 async def ask_floki(request: QueryRequest):
     try:
-        # Step 1: Vectorstore search
-        vector_results = search_vectorstore(request.query, n_results=request.n_results)
-        relevant_texts = " | ".join(vector_results['documents'][0]) if vector_results['documents'] else "No relevant news found."
+        try:
+            vector_results = search_vectorstore(request.query, n_results=request.n_results)
+            relevant_texts = " | ".join(vector_results['documents'][0]) if vector_results['documents'] else "No relevant news."
+        except Exception:
+            relevant_texts = "No relevant news."
 
-        # Step 2: Fetch last 5 news from DB as history
         async with async_session() as session:
-            result = await session.execute("SELECT title FROM news_items ORDER BY id DESC LIMIT 5")
-            rows = result.fetchall()
-            history = " | ".join([row[0] for row in rows]) if rows else "No history yet."
+            try:
+                result = await session.execute("SELECT title FROM news_items ORDER BY id ASC")
+                rows = result.fetchall()
+                history = " | ".join([row[0] for row in rows]) if rows else "No history yet."
+            except Exception:
+                history = "No history yet."
 
-        # Step 3: Combine prompt
-        prompt = f"User {request.user_id} Query: {request.query}\nHistory: {history}\nRelevant news: {relevant_texts}"
+        user_info = await get_user_info(request.user_id)
+        user_history = await get_user_history(request.user_id)
+        user_news = await get_user_relevant_news(request.user_id)
+        full_prompt = (
+            f"{user_info}\nHistory: {user_history}\nRelevant news: {user_news}\n"
+            f"Vectorstore results: {relevant_texts}\nQuery: {request.query}"
+        )
 
-        # Step 4: Run Floki agent
-        response = await Runner.run(news_agent, prompt)
-        return {"response": response.final_output}
+        try:
+            summarized_text = await Runner.run(news_agent, full_prompt)
+            final_output = summarized_text.final_output
+        except Exception:
+            final_output = "Sorry, I couldn't fetch information. Try again later."
+
+        return {"response": final_output}
 
     except Exception as e:
         logger.error(f"Error in /ask: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to process your request.")
+        raise HTTPException(status_code=500, detail="Failed to process request.")
 
-# -----------------------------
-# Update news DB + vectorstore
-# -----------------------------
-@app.post("/update_news")
-async def update_news():
+@app.post("/save_journal")
+async def save_journal(request: SaveJournalRequest):
     try:
-        articles = await run_collector()
-        if not articles:
-            return {"message": "No new articles collected."}
-
-        # Add to vectorstore
-        docs = [{"id": art.id, "title": art.title, "text": art.title} for art in articles]
-        add_documents_to_vectorstore(docs)
-        logger.info(f"Collected {len(articles)} articles and added to vectorstore.")
-        return {"message": f"Collected {len(articles)} articles and added to vectorstore."}
-
+        async with async_session() as session:
+            new_entry = Journal(
+                user_id=request.user_id,
+                text=request.text,
+                sentiment_score=request.sentiment_score
+            )
+            session.add(new_entry)
+            await session.commit()
+        return {"status": "✅ Journal saved!"}
     except Exception as e:
-        logger.error(f"Error in /update_news: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to update news.")
+        logger.error(f"Error saving journal: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to save journal.")
+
+@app.post("/update_embeddings")
+async def update_embeddings(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_async_task, fetch_and_embed_all)
+    return {"message": "✅ Embedding update started in background."}
+
+@app.post("/scrape_website")
+async def scrape_website(request: ScrapeRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_async_task, scrape_and_embed_website, request.url)
+    return {"message": f"✅ Scraping started for {request.url}"}
 
 # -----------------------------
-# Background task example (optional)
+# Startup event
 # -----------------------------
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Floki RAG Agent starting up...")
-    # Optionally run background news update every X seconds/minutes
-    # asyncio.create_task(periodic_news_update())
+    logger.info("Floki Live RAG Agent starting up...")
+    try:
+        await scrape_and_embed_website("https://fundedflow.app")
+    except Exception as e:
+        logger.error(f"Initial scrape error: {e}")
 
-# async def periodic_news_update():
-#     while True:
-#         try:
-#             await update_news()
-#         except Exception as e:
-#             logger.error(f"Periodic update failed: {str(e)}")
-#         await asyncio.sleep(3600)  # every hour
-==========
+    async def periodic_update():
+        while True:
+            try:
+                logger.info("Running periodic embedding update...")
+                await fetch_and_embed_all()
+            except Exception as e:
+                logger.error(f"Periodic update error: {e}")
+            await asyncio.sleep(600)  # 10 minutes
 
+    asyncio.create_task(periodic_update())
 
-
+# -----------------------------
+# Allow independent run of vectorstore
+# -----------------------------
+if __name__ == "__main__":
+    import sys
+    if "api" in sys.argv:
+        import uvicorn
+        uvicorn.run(app, host="127.0.0.1", port=8000, reload=True)
+    else:
+        asyncio.run(fetch_and_embed_all())
+        asyncio.run(scrape_and_embed_website("https://example.com"))
+==================================================================================================================================
 
 
 uvicorn api:app --reload

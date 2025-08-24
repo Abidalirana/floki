@@ -1,14 +1,11 @@
-# floki_agent.py
-
 import asyncio
-from sqlalchemy import text
 from datetime import datetime, timezone
-
-from vectorstore import fetch_and_embed_all, scrape_and_embed_website, search_vectorstore, add_documents_to_vectorstore
-from db import async_session
-from config import GEMINI_API_KEY
+import chromadb
+from sentence_transformers import SentenceTransformer
 from agents import Agent, Runner, OpenAIChatCompletionsModel, set_tracing_disabled, function_tool
 from openai import AsyncOpenAI
+import requests
+from bs4 import BeautifulSoup
 
 # -----------------------------
 # Disable tracing for cleaner logs
@@ -16,15 +13,14 @@ from openai import AsyncOpenAI
 set_tracing_disabled(True)
 
 # -----------------------------
-# Gemini client (AsyncOpenAI)
+# Setup ChromaDB & Embeddings
 # -----------------------------
-client = AsyncOpenAI(
-    api_key=GEMINI_API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-)
+client = chromadb.Client()
+collection = client.get_or_create_collection("floki_embeddings")
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # -----------------------------
-# Floki system instruction
+# Floki System Instruction
 # -----------------------------
 FLOKI_INSTRUCTION = (
     "Your name is Floki. You are a friendly, helpful, and super encouraging AI onboarding "
@@ -43,18 +39,47 @@ FLOKI_INSTRUCTION = (
 )
 
 # -----------------------------
-# Model setup
+# OpenAI Gemini Client
 # -----------------------------
-model = OpenAIChatCompletionsModel(
-    model="gemini-2.0-flash",
-    openai_client=client,
+client_ai = AsyncOpenAI(
+    api_key="YOUR_GEMINI_API_KEY",   # 🔑 replace with your key
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
 # -----------------------------
-# Async helper functions
+# Model setup
+# -----------------------------
+model_ai = OpenAIChatCompletionsModel(
+    model="gemini-2.0-flash",
+    openai_client=client_ai,
+)
+
+# -----------------------------
+# Vectorstore Helpers
+# -----------------------------
+def add_to_vectorstore(text: str, metadata: dict = None):
+    vector = model.encode(text).tolist()
+    collection.add(
+        documents=[text],
+        embeddings=[vector],
+        ids=[str(hash(text))],
+        metadatas=[metadata or {}]
+    )
+
+def search_vectorstore(query: str, n_results: int = 3):
+    query_vector = model.encode(query).tolist()
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"]
+    )
+    return results
+
+# -----------------------------
+# Agent Tools
 # -----------------------------
 async def summarize_text(text: str) -> str:
-    resp = await client.chat.completions.create(
+    resp = await client_ai.chat.completions.create(
         model="gemini-2.0-flash",
         messages=[{"role": "user", "content": f"Summarize this text in 3 bullet points:\n{text}"}],
         temperature=0.3
@@ -65,18 +90,14 @@ async def get_user_info(user_id: str) -> str:
     return f"User {user_id} | Name: Abid | Role: Reader"
 
 async def get_user_history(user_id: str) -> str:
-    async with async_session() as session:
-        result = await session.execute(text("SELECT title FROM news_items ORDER BY id DESC LIMIT 5"))
-        rows = result.fetchall()
-        return " | ".join([row[0] for row in rows]) if rows else "No history yet."
+    results = search_vectorstore("trading", n_results=3)
+    return " | ".join(results['documents'][0]) if results['documents'] else "No history yet."
 
 async def get_user_relevant_news(user_id: str) -> str:
     results = search_vectorstore("stocks", n_results=3)
     return " | ".join(results['documents'][0]) if results['documents'] else "No news found."
 
-# -----------------------------
-# Register functions as Agent tools
-# -----------------------------
+# Register as tools
 summarize_text_tool = function_tool(summarize_text)
 get_user_info_tool = function_tool(get_user_info)
 get_user_history_tool = function_tool(get_user_history)
@@ -85,7 +106,7 @@ get_user_relevant_news_tool = function_tool(get_user_relevant_news)
 # -----------------------------
 # Floki Agent
 # -----------------------------
-news_agent = Agent(
+floki_agent = Agent(
     name="FlokiNewsAssistant",
     instructions=FLOKI_INSTRUCTION,
     tools=[
@@ -94,7 +115,7 @@ news_agent = Agent(
         get_user_history_tool,
         get_user_relevant_news_tool,
     ],
-    model=model
+    model=model_ai
 )
 
 # -----------------------------
@@ -111,28 +132,44 @@ async def interactive_loop():
             print("🛑 Exiting Floki Agent testing loop.")
             break
 
-        # Fetch info/history/news
-        user_info = await get_user_info(user_id)
-        history = await get_user_history(user_id)
-        relevant_news = await get_user_relevant_news(user_id)
-        full_prompt = f"{user_info}\nHistory: {history}\nRelevant news: {relevant_news}\nQuery: {query}"
-
         # Run agent
-        summarized_text = await Runner.run(news_agent, full_prompt)
-        print("\n💬 Floki Agent Response:\n", summarized_text.final_output)
+        response = await Runner.run(floki_agent, query)
+        print("\n💬 Floki Agent Response:\n", response.final_output)
 
-        # ✅ Add last query to vectorstore (fixed metadata)
-        add_documents_to_vectorstore([
-            {
-                "text": query,
-                "metadata": {  # ✅ singular key
-                    "user_id": user_id,
-                    "source": "interactive_loop",
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-            }
-        ])
+        # ✅ Save query in vectorstore
+        add_to_vectorstore(query, {
+            "user_id": user_id,
+            "source": "interactive_loop",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
         print("✅ Query added to vectorstore.\n")
+
+# -----------------------------
+# NEW: Website Fetch & Embed
+# -----------------------------
+async def fetch_and_embed_all():
+    url = "https://fundedflow.app"   # 👈 changed here
+    print(f"🌐 Fetching content from {url} ...")
+
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        paragraphs = [p.get_text(strip=True) for p in soup.find_all("p")]
+        texts = [t for t in paragraphs if len(t) > 30]  # filter small junk
+
+        if not texts:
+            print("⚠️ No text extracted.")
+            return
+
+        for text in texts:
+            add_to_vectorstore(text, {"source": url, "timestamp": datetime.now(timezone.utc).isoformat()})
+
+        print(f"✅ Embedded {len(texts)} paragraphs from {url}")
+
+    except Exception as e:
+        print(f"❌ Error fetching {url}: {e}")
 
 # -----------------------------
 # Run

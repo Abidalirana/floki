@@ -154,6 +154,9 @@ class SimulatorLog(Base):
 # --------------------------
 # News Items
 # --------------------------
+# --------------------------
+# News Items
+# --------------------------
 class NewsItem(Base):
     __tablename__ = "news_items"
     id = Column(Integer, primary_key=True, index=True)
@@ -161,7 +164,10 @@ class NewsItem(Base):
     url = Column(String, nullable=True)
     summary = Column(Text, nullable=True)
     detailed_summary = Column(Text, nullable=True)
+    text = Column(Text, nullable=True)  # ✅ Added this column
     keywords = Column(String, nullable=True)
+    keys = Column(String, nullable=True)  # ✅ Add this column
+
 
 # --------------------------
 # Create All Tables Helper
