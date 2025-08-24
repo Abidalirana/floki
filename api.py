@@ -3,10 +3,11 @@
 import asyncio
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from vectorstore import fetch_and_embed_all, scrape_and_embed_website, search_vectorstore
+from vectorstore import fetch_and_embed_all, scrape_and_embed_website, search_vectorstore, add_documents_to_vectorstore
 from db import async_session, Journal
-from agent import news_agent, Runner, get_user_info, get_user_history, get_user_relevant_news
+from floki_agent import news_agent, Runner, get_user_info, get_user_history, get_user_relevant_news
 import logging
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,26 +43,57 @@ async def root():
 @app.post("/ask")
 async def ask_floki(request: QueryRequest):
     try:
-        # Search vectorstore
-        vector_results = search_vectorstore(request.query, n_results=request.n_results)
-        relevant_texts = " | ".join(vector_results['documents'][0]) if vector_results['documents'] else "No relevant news."
+        # Safe vectorstore search
+        try:
+            vector_results = search_vectorstore(request.query, n_results=request.n_results)
+            relevant_texts = " | ".join(vector_results['documents'][0]) if vector_results['documents'] else "No relevant news."
+        except Exception:
+            relevant_texts = "No relevant news."
 
-        # Fetch DB history
+        # Safe DB history
         async with async_session() as session:
-            result = await session.execute("SELECT title FROM news_items ORDER BY id ASC")
-            rows = result.fetchall()
-            history = " | ".join([row[0] for row in rows]) if rows else "No history yet."
+            try:
+                result = await session.execute("SELECT title FROM news_items ORDER BY id ASC")
+                rows = result.fetchall()
+                history = " | ".join([row[0] for row in rows]) if rows else "No history yet."
+            except Exception:
+                history = "No history yet."
 
         # Compose prompt
         user_info = await get_user_info(request.user_id)
         user_history = await get_user_history(request.user_id)
         user_news = await get_user_relevant_news(request.user_id)
-        full_prompt = f"{user_info}\nHistory: {user_history}\nRelevant news: {user_news}\nQuery: {request.query}"
+        full_prompt = (
+            f"{user_info}\n"
+            f"History: {user_history}\n"
+            f"Relevant news: {user_news}\n"
+            f"Vectorstore results: {relevant_texts}\n"
+            f"Query: {request.query}"
+        )
 
-        # Run agent
-        summarized_text = await Runner.run(news_agent, full_prompt)
+        # Safe agent call
+        try:
+            summarized_text = await Runner.run(news_agent, full_prompt)
+            final_output = summarized_text.final_output
+        except Exception:
+            final_output = "Sorry, I couldn't fetch information. Try again later."
 
-        return {"response": summarized_text.final_output}
+        # Save query to vectorstore safely
+        try:
+            add_documents_to_vectorstore([
+                {
+                    "text": request.query,
+                    "metadatas": {
+                        "user_id": request.user_id,
+                        "source": "ask_endpoint",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                }
+            ])
+        except Exception:
+            pass
+
+        return {"response": final_output}
 
     except Exception as e:
         logger.error(f"Error in /ask: {str(e)}")
@@ -105,9 +137,13 @@ async def scrape_website(request: ScrapeRequest, background_tasks: BackgroundTas
 @app.on_event("startup")
 async def startup_event():
     logger.info("Floki Live RAG Agent starting up...")
-    website_url = "https://fundedflow.app"
-    asyncio.create_task(scrape_and_embed_website(website_url))
 
+    # Embed FundedFlow website at launch to ensure vectorstore has real data
+   
+    
+    await scrape_and_embed_website("https://fundedflow.app")
+
+    # Periodic background update every 10 minutes
     async def periodic_update():
         while True:
             try:
@@ -115,6 +151,6 @@ async def startup_event():
                 await fetch_and_embed_all()
             except Exception as e:
                 logger.error(f"Periodic update error: {str(e)}")
-            await asyncio.sleep(60*10)
+            await asyncio.sleep(60 * 10)
 
     asyncio.create_task(periodic_update())
