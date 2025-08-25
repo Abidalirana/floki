@@ -3,11 +3,12 @@ import logging
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from floki_agent import (
+    Runner,
+    floki_agent,
     search_vectorstore,
     get_user_info,
     get_user_history,
     get_user_relevant_news,
-    floki_agent,
     save_query,
     add_to_vectorstore,
     fetch_and_embed_website,
@@ -38,6 +39,19 @@ class EmbedRequest(BaseModel):
     url: str
 
 # -----------------------------
+# Helper functions
+# -----------------------------
+def flatten_documents(docs):
+    """Flatten nested list of documents safely"""
+    flat = []
+    for d in docs:
+        if isinstance(d, list):
+            flat.extend([str(x) for x in d])
+        else:
+            flat.append(str(d))
+    return flat
+
+# -----------------------------
 # GET endpoints
 # -----------------------------
 @app.get("/")
@@ -50,16 +64,16 @@ async def past_queries(user_id: str = Query(..., description="User ID to fetch p
         queries = await get_past_queries(user_id)
         return {"user_id": user_id, "queries": queries}
     except Exception as e:
-        logger.error(f"Error fetching past queries for {user_id}: {str(e)}")
+        logger.exception(f"Error fetching past queries for {user_id}")
         raise HTTPException(status_code=500, detail="Failed to fetch past queries.")
 
 @app.get("/vectorstore_status")
 async def vectorstore_status():
     try:
-        num_docs = len(collection.get(include=["documents"])["documents"])
+        num_docs = len(collection.get(include=["documents"]).get("documents", []))
         return {"num_documents": num_docs}
     except Exception as e:
-        logger.error(f"Error fetching vectorstore status: {str(e)}")
+        logger.exception("Error fetching vectorstore status")
         raise HTTPException(status_code=500, detail="Failed to fetch vectorstore status.")
 
 # -----------------------------
@@ -68,42 +82,55 @@ async def vectorstore_status():
 @app.post("/ask")
 async def ask_floki(request: QueryRequest):
     try:
-        # Search vectorstore for relevant context
+        # 1️⃣ Search vectorstore for relevant context
         results = search_vectorstore(request.query, n_results=request.n_results)
-        relevant_texts = " | ".join(results['documents'][0]) if results['documents'] else "No relevant info found."
+        flat_docs = flatten_documents(results.get("documents", []))
+        relevant_texts = " | ".join(flat_docs) if flat_docs else "No relevant info found."
 
-        # Get user info, history, and news
+        # 2️⃣ Get user info, history, and news
         user_info = await get_user_info(request.user_id)
         user_history = await get_user_history(request.user_id)
         user_news = await get_user_relevant_news(request.user_id)
 
-        # Build full prompt
+        # 3️⃣ Build full prompt
         full_prompt = (
             f"{user_info}\nHistory: {user_history}\nRelevant news: {user_news}\n"
             f"Vectorstore context: {relevant_texts}\nUser Query: {request.query}"
         )
 
-        # Generate response from Floki agent
-        response = await floki_agent.run(full_prompt, context={"user_id": request.user_id})
+        # 4️⃣ Generate response using Runner
+        response = await Runner.run(floki_agent, full_prompt, context={"user_id": request.user_id})
 
-        # Save query in DB and vectorstore
+        # 5️⃣ Save query in DB and vectorstore
         await save_query(request.user_id, request.query)
         add_to_vectorstore(request.query, {"user_id": request.user_id, "source": "ask_endpoint"})
 
-        return {"response": response.final_output}
+        return {
+            "response": getattr(response, "final_output", str(response)),
+            "vectorstore_context": relevant_texts,
+            "user_history": user_history
+        }
 
     except Exception as e:
-        logger.error(f"Error in /ask: {str(e)}")
+        logger.exception("Error in /ask endpoint")
         raise HTTPException(status_code=500, detail="Failed to process request.")
+#=============================================
 
+#===============================================
 @app.post("/embed_website")
 async def embed_website(request: EmbedRequest):
+    # ✅ Validate URL first
+    if not request.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    
     try:
         await fetch_and_embed_website(request.url)
         return {"message": f"✅ Website {request.url} fetched and embedded successfully."}
     except Exception as e:
-        logger.error(f"Error embedding website {request.url}: {str(e)}")
+        logger.exception(f"Error embedding website {request.url}")
         raise HTTPException(status_code=500, detail="Failed to fetch and embed website.")
+
+
 
 # -----------------------------
 # Startup event
@@ -115,7 +142,7 @@ async def startup_event():
         await fetch_and_embed_website("https://fundedflow.app/")
         logger.info("✅ FundedFlow website embedded successfully at startup.")
     except Exception as e:
-        logger.error(f"❌ Failed to embed FundedFlow website at startup: {e}")
+        logger.exception("❌ Failed to embed FundedFlow website at startup")
 
 # -----------------------------
 # Run server

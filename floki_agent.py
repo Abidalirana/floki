@@ -89,8 +89,9 @@ model_ai = OpenAIChatCompletionsModel(
 # -----------------------------
 FLOKI_INSTRUCTION = (
     "You are Floki, a friendly AI assistant for FundedFlow premium users. "
-    "Always greet users warmly and keep messages short and engaging. "
-    "Provide full module explanations only when the user asks. "
+    "Always greet users warmly with a short intro like 'Hi! I’m Floki 👋 Your trading buddy.' "
+    "Do NOT give long context or advice until the user asks or engages. "
+    "Provide full module explanations only when requested. "
     "Focus on helping the current user improve their trading skills and mindset. "
     "Do NOT share other users’ personal info under any circumstances. "
     "Follow all FundedFlow rules and privacy policies. "
@@ -131,7 +132,16 @@ async def get_user_info(user_id: str) -> str:
 
 async def get_user_history(user_id: str) -> str:
     results = search_vectorstore("trading", n_results=3)
-    return " | ".join(results['documents'][0]) if results['documents'] else "No trading history yet."
+    try:
+        docs = results.get('documents', [])
+        if docs and isinstance(docs[0], list):
+            return " | ".join(docs[0])
+        elif docs:
+            return " | ".join([str(d) for d in docs])
+        else:
+            return "No trading history yet."
+    except Exception as e:
+        return "Error fetching history."
 
 async def get_user_relevant_news(user_id: str) -> str:
     results = search_vectorstore("stocks", n_results=3)
@@ -177,29 +187,37 @@ floki_agent = Agent(
 # -----------------------------
 # Website fetch & embed
 # -----------------------------
+import httpx
+from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+
 async def fetch_and_embed_website(url: str):
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True)) > 30]
-        for text in paragraphs:
-            add_to_vectorstore(text, {"source": url, "timestamp": datetime.now(timezone.utc).isoformat()})
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True)) > 30]
+
+            for text in paragraphs:
+                unique_id = str(hash(url + text))
+                add_to_vectorstore(text, {"source": url, "timestamp": datetime.now(timezone.utc).isoformat(), "id": unique_id})
+
         print(f"✅ Embedded {len(paragraphs)} paragraphs from {url}")
+
     except Exception as e:
         print(f"❌ Error fetching {url}: {e}")
 
-
-
-
 # -----------------------------
-
-
+# Interactive loop with dynamic intro
 # -----------------------------
 async def interactive_loop():
     session_id = "current_session"
     print("🟢 Floki Agent Interactive Testing Started! Type 'exit' to quit.\n")
-    print("💬 Floki: Hi! I'm Floki 👋 Your trading buddy. Let's make your trading journey awesome! 🚀\n")
+
+    # Generate intro dynamically
+    intro = await Runner.run(floki_agent, "Start with a short friendly intro message for a premium user.", context={"user_id": session_id})
+    print(f"💬 Floki: {intro.final_output}\n")
 
     while True:
         query = input("Enter your query: ").strip()
@@ -207,11 +225,7 @@ async def interactive_loop():
             print("🛑 Exiting Floki Agent testing loop.")
             break
 
-        # Run agent
-        response = await Runner.run(floki_agent, query, context={"user_id": session_id})
-        print("\n💬 Floki Agent Response:\n", response.final_output)
-
-        # Save query to DB & vectorstore
+        # Save query first (so we have context)
         await save_query(session_id, query)
         add_to_vectorstore(query, {
             "user_id": session_id,
@@ -220,9 +234,17 @@ async def interactive_loop():
         })
         print("✅ Query saved to DB and added to vectorstore.\n")
 
-        # Suggest improvements automatically
-        tips = await suggest_improvements(session_id)
-        print("💡 Floki Improvement Tips:\n", tips, "\n")
+        # Detect if user wants advice
+        if any(word in query.lower() for word in ["help", "advise", "tips", "improve", "strategy"]):
+            # User asked for guidance → give improvements
+            tips = await suggest_improvements(session_id)
+            print("💡 Floki Improvement Tips:\n", tips, "\n")
+        else:
+            # Just listen first
+            response = await Runner.run(floki_agent, query, context={"user_id": session_id})
+            print("\n💬 Floki Agent Response:\n", response.final_output)
+            print("🟢 Floki is listening. Say 'help' or 'tips' if you want improvement advice.\n")
+
 
 # -----------------------------
 # Main entry
